@@ -74,6 +74,13 @@ spec:
       {{- if or (.Values.serviceAccount.create) (.Values.serviceAccountName) }}
       serviceAccountName: {{ template "superset.serviceAccountName" . }}
       {{- end }}
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: DoNotSchedule
+          labelSelector:
+            matchLabels:
+              app: {{ template "superset.name" . }}
       securityContext:
         runAsUser: {{ .Values.runAsUser }}
         {{- if .Values.supersetNode.podSecurityContext }}
