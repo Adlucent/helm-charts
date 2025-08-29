@@ -80,8 +80,8 @@ diagnosticMode:
 ## @param image.debug Enable image debug mode
 ##
 image:
-  registry: gcr.io
-  repository: adl-aura-staging/redis
+  registry: docker.io
+  repository: bitnami/redis
   tag: 7.0.10-debian-11-r4
   digest: ""
   ## Specify a imagePullPolicy

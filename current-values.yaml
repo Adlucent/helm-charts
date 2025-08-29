@@ -1,0 +1,815 @@
+USER-SUPPLIED VALUES:
+affinity: {}
+bootstrapScript: "# #!/bin/bash\n# pip install \\\n# dnspython==2.6.1 \\\n# authlib==1.2.0
+  \\\n# psycopg2-binary==2.9.6 \n# shillelagh[gsheetsapi] \\\n# sqlalchemy-bigquery
+  \\\n# snowflake-sqlalchemy \\\n# pandas-gbq \\\n# redis==4.6.0 && \\\n\nif [ ! -f
+  ~/bootstrap ]; then echo \"Running Superset with uid {{ .Values.runAsUser }}\" >
+  ~/bootstrap; fi\n"
+configFromSecret: '{{ template "superset.fullname" . }}-config'
+configMountPath: /app/pythonpath
+configOverrides:
+  activity_log: "import json\nimport logging\nimport requests\nfrom datetime import
+    datetime\nfrom flask import g, request\nfrom google.cloud import bigquery\nfrom
+    superset.utils.log import AbstractEventLogger\nfrom superset.extensions import
+    stats_logger_manager\nfrom superset.utils.core import get_user_id, get_username\n\nlogger
+    = logging.getLogger(__name__)\n\ndef get_project_id():\n    try:\n        METADATA_URL
+    = \"http://metadata.google.internal/computeMetadata/v1/project/project-id\"\n
+    \       headers = {\"Metadata-Flavor\": \"Google\"}\n        resp = requests.get(METADATA_URL,
+    headers=headers, timeout=2)\n        resp.raise_for_status()\n        return resp.text\n
+    \   except Exception as e:\n        logger.warning(\"Could not get project ID
+    from metadata server: %s\", e)\n        return \"unknown_project\"\n\ndef get_dashboard_chart_names(dashboard_id,
+    slice_id):\n    \"\"\"Fetch dashboard and chart names from the database\"\"\"\n
+    \   dashboard_name = None\n    chart_name = None\n\n    try:\n        from superset.models.dashboard
+    import Dashboard\n        from superset.models.slice import Slice\n        from
+    superset import db\n\n        # Look up dashboard name if we have a valid dashboard_id\n
+    \       if dashboard_id and str(dashboard_id) != \"0\":\n            dashboard
+    = db.session.query(Dashboard).filter_by(id=int(dashboard_id)).first()\n            if
+    dashboard:\n                dashboard_name = dashboard.dashboard_title\n\n        #
+    Look up chart/slice name if we have a valid slice_id\n        if slice_id and
+    str(slice_id) != \"0\":\n            slice_obj = db.session.query(Slice).filter_by(id=int(slice_id)).first()\n
+    \           if slice_obj:\n                chart_name = slice_obj.slice_name\n
+    \   except Exception as e:\n        logger.warning(f\"Failed to fetch dashboard/chart
+    names: {e}\")\n\n    return dashboard_name, chart_name\n\nclass BigQueryEventLogger(AbstractEventLogger):\n
+    \   def __init__(self):\n        super().__init__()\n        self.client = None\n
+    \       self.table = None\n        self._initialized = False\n        logger.warning(\"\U0001F680
+    BigQueryEventLogger initialized\")\n\n    def _ensure_initialized(self):\n        if
+    self._initialized and self.table:\n            return True\n\n        try:\n            if
+    not self.client:\n                self.client = bigquery.Client()\n\n            project_id
+    = get_project_id()\n            # Use the fully qualified table ID string instead
+    of table reference\n            table_id = f\"{project_id}.aura_activity_log.log\"\n\n
+    \           # Just store the table ID string, don't try to get the table object\n
+    \           self.table_id = table_id\n            self._initialized = True\n            logger.warning(f\"✅
+    BigQuery client initialized with table ID: {table_id}\")\n            return True\n
+    \       except Exception as e:\n            logger.exception(\"Failed to initialize
+    BigQuery client: %s\", e)\n            return False\n\n    def log(\n        self,\n
+    \       user_id,\n        action,\n        records=None,\n        dashboard_id=None,\n
+    \       slice_id=None,\n        duration_ms=None,\n        referrer=None,\n        curated_payload=None,\n
+    \       curated_form_data=None,\n        **kwargs\n    ):\n        logger.warning(f\"\U0001F4CC
+    BigQueryEventLogger.log called for action: {action}\")\n\n        if not self._ensure_initialized():\n
+    \           logger.error(\"Failed to initialize BigQuery client\")\n            return\n\n
+    \       if not records:\n            records = [{}]\n\n        # Get the username
+    for the current user\n        username = get_username()\n\n        # Get dashboard
+    and chart names\n        dashboard_name, chart_name = get_dashboard_chart_names(dashboard_id,
+    slice_id)\n\n        rows_to_insert = []\n        for record in records:\n            try:\n
+    \               # Generate a numeric ID from timestamp and random component\n
+    \               import random\n                timestamp_ms = int(datetime.utcnow().timestamp()
+    * 1000)\n                random_component = random.randint(0, 999999)\n                numeric_id
+    = int(f\"{timestamp_ms}{random_component:06d}\")\n\n                log_row =
+    {\n                    \"id\": numeric_id,\n                    \"dashboard_id\":
+    dashboard_id,\n                    \"slice_id\": slice_id,\n                    \"duration_ms\":
+    int(duration_ms) if duration_ms else None,\n                    \"user_id\": user_id,\n
+    \                   \"username\": username,\n                    \"dashboard_name\":
+    dashboard_name,  # Add dashboard name\n                    \"chart_name\": chart_name,
+    \         # Add chart name\n                    \"dttm\": datetime.utcnow().isoformat(),\n
+    \                   \"action\": action,\n                    \"referrer\": referrer,\n
+    \                   \"json\": json.dumps({\n                        **record,\n
+    \                       \"curated_payload\": curated_payload or {},\n                        \"curated_form_data\":
+    curated_form_data or {},\n                        **kwargs\n                    })\n
+    \               }\n                rows_to_insert.append(log_row)\n            except
+    Exception as e:\n                logger.exception(f\"Failed to prepare log row:
+    {e}\")\n\n        if rows_to_insert:\n            try:\n                # Use
+    insert_rows_json with just the table ID string\n                errors = self.client.insert_rows_json(\n
+    \                   self.table_id,  # Just pass the string table ID\n                    rows_to_insert,\n
+    \                   ignore_unknown_values=True,  # Ignore extra fields\n                    skip_invalid_rows=False\n
+    \               )\n                if errors:\n                    logger.error(f\"Failed
+    to insert rows to BigQuery: {errors}\")\n                else:\n                    logger.warning(f\"✅
+    Successfully logged {len(rows_to_insert)} rows to BigQuery\")\n            except
+    Exception as e:\n                logger.exception(f\"Failed to send logs to BigQuery:
+    {e}\")\n\n# Configure Superset to use our custom logger\nEVENT_LOGGER = BigQueryEventLogger()\nlogger.warning(\"\U0001F3AF
+    EVENT_LOGGER set to BigQueryEventLogger instance\")\n"
+  celeryConfig: "from celery.schedules import crontab\n\nclass CeleryConfig:\n  broker_url
+    = f\"redis://{env('REDIS_HOST')}:{env('REDIS_PORT')}/0\"\n  imports = (\n      \"superset.sql_lab\",\n
+    \     \"superset.tasks.cache\",\n      \"superset.tasks.scheduler\",\n  )\n  result_backend
+    = f\"redis://{env('REDIS_HOST')}:{env('REDIS_PORT')}/0\"\n  worker_prefetch_multiplier
+    = 10\n  task_acks_late = True\n  task_annotations = {\n      \"sql_lab.get_sql_results\":
+    {\n          \"rate_limit\": \"100/s\",\n      },\n  }\n  beat_schedule = {\n
+    \     'email_reports.schedule_hourly': {\n      'task': 'email_reports.schedule_hourly',\n
+    \     'schedule': crontab(minute=1, hour='*'),\n      },\n      # 'alerts.schedule_check':
+    {\n      #     'task': 'alerts.schedule_check',\n      #     'schedule': crontab(minute='*',
+    hour='*'),\n      # },\n      'reports.scheduler': {\n          'task': 'reports.scheduler',\n
+    \         'schedule': crontab(minute='*', hour='*'),\n      },\n      'reports.prune_log':
+    {\n          'task': 'reports.prune_log',\n          'schedule': crontab(minute=0,
+    hour=0),\n      },\n      # 'cache-warmup-hourly': {\n      #     'task': 'cache-warmup',\n
+    \     #     'schedule': crontab(minute='*/30', hour='*'),\n      #     'kwargs':
+    {\n      #         'strategy_name': 'top_n_dashboards',\n      #         'top_n':
+    10,\n      #         'since': '7 days ago',\n      #     },\n  }\n  \nCELERY_CONFIG
+    = CeleryConfig\n\nSCREENSHOT_LOCATE_WAIT = 400\nSCREENSHOT_LOAD_WAIT = 400\n\nfrom
+    superset.tasks.types import ExecutorType\n\n# EMAIL_REPORTS_USER = \"admin\"\nTHUMBNAIL_SELENIUM_USER
+    = 'admin'\nALERT_REPORTS_EXECUTE_AS = [\n  ExecutorType.CREATOR_OWNER,\n  ExecutorType.CREATOR,\n
+    \ ExecutorType.MODIFIER_OWNER,\n  ExecutorType.MODIFIER,\n  ExecutorType.OWNER,\n
+    \ ExecutorType.SELENIUM,\n] \n"
+  enable_oauth: |
+    ENABLE_PROXY_FIX = True
+    from flask_appbuilder.security.manager import AUTH_DB, AUTH_OAUTH
+
+    # Map Authlib roles to superset roles
+    AUTH_ROLE_ADMIN = 'Admin'
+    AUTH_ROLE_PUBLIC = 'Public'
+    USE_OAUTH_LOGIN = True
+
+    if USE_OAUTH_LOGIN is False:
+        AUTH_TYPE = AUTH_DB
+    else:
+        AUTH_TYPE = AUTH_OAUTH
+
+    AUTH_USER_ADMINS = [
+        'blair.mundy@adlucent.com',
+        'dan.muldoon+2@adlucent.com',
+        'dan.muldoon@adlucent.com',
+        'kelly.weeks@adlucent.com',
+        'matt.zeiger@adlucent.com',
+    ]
+
+    # Will allow user self registration, allowing to create Flask users from Authorized User
+    AUTH_USER_REGISTRATION = True
+    # The default user self registration role
+    AUTH_USER_REGISTRATION_ROLE = "Public"
+
+    from superset.security import SupersetSecurityManager
+    import logging
+    logger = logging.getLogger(__name__)
+    logger.setLevel(logging.DEBUG)
+
+    class CustomSsoSecurityManager(SupersetSecurityManager):
+      def oauth_user_info(self, provider, response=None):
+          logging.debug("OAuth2 provider: {0}.".format(provider))
+          if provider == 'auth0':
+              # Retrieve the user information from the OAuth provider
+              me_response = self.appbuilder.sm.oauth_remotes[provider].get(
+                  os.getenv('OAUTH_BASE_URL') + '/userinfo'
+              )
+
+              if me_response.status_code == 200:
+                  me_data = me_response.json()
+                  logging.debug("User data: {0}".format(me_data))
+
+                  # Extract UPN from custom claim (if present)
+                  upn = me_data.get("barkleyokrp_upn", None)
+
+                  # Fallback to name parsing
+                  name_parts = me_data.get('name', '').split(' ', 1)
+                  first_name = name_parts[0] if name_parts else ''
+                  last_name = name_parts[1] if len(name_parts) > 1 else ''
+
+                  return {
+                      'name': me_data.get('name', me_data.get('email', '')),
+                      'email': me_data.get('email', ''),
+                      'id': upn or me_data.get('email', ''),
+                      'username': upn or me_data.get('email', ''),
+                      'first_name': me_data.get('first_name', me_data.get('given_name', first_name)),
+                      'last_name': me_data.get('last_name', me_data.get('family_name', last_name))
+                  }
+              else:
+                  logging.error("Failed to retrieve user information. Status code: {0}".format(me_response.status_code))
+                  return None
+
+    CUSTOM_SECURITY_MANAGER = CustomSsoSecurityManager
+
+    OAUTH_PROVIDERS = [
+    {
+            'name':'auth0',
+            'token_key': 'access_token',
+            'icon':'fa-at',
+            'remote_app': {
+                'client_id': os.getenv('OAUTH_CLIENT_ID'),
+                'client_secret': os.getenv('OAUTH_CLIENT_SECRET'),
+                "server_metadata_url": os.getenv('OAUTH_BASE_URL') + '/.well-known/openid-configuration',
+                'client_kwargs': {'scope': 'openid profile email',},
+                'base_url': os.getenv('OAUTH_BASE_URL'),
+                'access_token_url': os.getenv('OAUTH_BASE_URL') + '/oauth/token',
+                'authorize_url': os.getenv('OAUTH_BASE_URL') + '/authorize',
+                'access_token_method': 'POST'
+            }
+      }
+    ]
+  feature_flags: |
+    FEATURE_FLAGS = {
+      'DASHBOARD_RBAC': True,
+      'ALERT_REPORTS': True,
+      'ALERTS_ATTACH_REPORTS': True,
+      'ALERT_REPORT_SLACK_V2': True,
+      'ENABLE_TEMPLATE_PROCESSING': True,
+      # Enable custom plugins
+      'ENABLE_JAVASCRIPT_CONTROLS': True,
+      'DASHBOARD_NATIVE_FILTERS': True,
+      'DASHBOARD_CROSS_FILTERS': True,
+      'DASHBOARD_NATIVE_FILTERS_SET': True,
+    }
+  misc_overrides: |
+    ALERT_REPORTS_NOTIFICATION_DRY_RUN = False
+    MAPBOX_API_KEY = os.getenv('MAPBOX_API_KEY')
+  performance: "# Extend timeout to allow long running queries.\nSUPERSET_WEBSERVER_TIMEOUT
+    = 300\nSQL_MAX_ROW = 1000000\nROW_LIMIT = 1000000\nSQLLAB_TIMEOUT=300\nSQLALCHEMY_POOL_SIZE
+    = 45\nSQLALCHEMY_MAX_OVERFLOW = 30\nSQLALCHEMY_POOL_TIMEOUT = 180\nSUPERSET_DASHBOARD_POSITION_DATA_LIMIT
+    = 131070\n\n# Use Redis to Cache Explore Chart Data\nEXPLORE_FORM_DATA_CACHE_CONFIG
+    = {\n  'CACHE_TYPE': 'RedisCache',\n  'CACHE_DEFAULT_TIMEOUT': 1800,\n  'CACHE_KEY_PREFIX':
+    'superset_explore_cache',\n  'CACHE_REDIS_URL': f'redis://{os.getenv(\"REDIS_HOST\")}:{os.getenv(\"REDIS_PORT\")}/0'\n}\n\n#
+    Redis Cache for Dashboard Filter State\nFILTER_STATE_CACHE_CONFIG = {\n  'CACHE_TYPE':
+    'RedisCache',\n  'CACHE_DEFAULT_TIMEOUT': 1800, # 24 hours in seconds\n  'CACHE_KEY_PREFIX':
+    'superset_filter_cache',\n  'CACHE_REDIS_URL': f'redis://{os.getenv(\"REDIS_HOST\")}:{os.getenv(\"REDIS_PORT\")}/0'\n}\n\n#
+    Leverage Superset's Native Caching Mehanism\nDATA_CACHE_CONFIG = {\n  'CACHE_TYPE':
+    'RedisCache',\n  'CACHE_DEFAULT_TIMEOUT': 1800,\n  'CACHE_KEY_PREFIX': 'superset_data_cache',\n
+    \ 'CACHE_REDIS_URL': f'redis://{os.getenv(\"REDIS_HOST\")}:{os.getenv(\"REDIS_PORT\")}/0'\n}\n#
+    AURA-79 - Make user/role type stuff available via FAB API\nFAB_ADD_SECURITY_API
+    = True\n\n# Define content security policy\nTALISMAN_CONFIG = {\n    'content_security_policy':
+    {\n        'default-src': ['\\'self\\''],\n        'img-src': [\n            '\\'self\\'',
+    \n            'data:', \n            'https://tpc.googlesyndication.com',\n            'https://storage.cloud.google.com',\n
+    \           'https://*.googleusercontent.com',\n            'https://storage.googleapis.com'\n
+    \           # Add any other image sources you need\n        ],\n        'media-src':
+    [\n            '\\'self\\'',\n            'https://tpc.googlesyndication.com',\n
+    \           'https://storage.cloud.google.com',\n            'https://*.googleusercontent.com',\n
+    \           'https://storage.googleapis.com'\n        ],\n        'script-src':
+    [\n            '\\'self\\'',\n            '\\'unsafe-inline\\'',\n            '\\'unsafe-eval\\'',\n
+    \       ],\n        'style-src': [\n            '\\'self\\'',\n            '\\'unsafe-inline\\'',\n
+    \       ],\n        'connect-src': [\n            '\\'self\\'',\n            #
+    Add any API endpoints you need to connect to\n        ],\n        'frame-src':
+    [\n            '\\'self\\'',\n            # Add any domains you want to allow
+    in iframes\n        ],\n    },\n    'content_security_policy_nonce_in': ['script-src'],\n}\n"
+  redirect_to_dashboards: |
+    import logging
+    import pprint
+    from flask import redirect, g, request
+    from flask_appbuilder import expose, IndexView
+
+    from superset import security_manager
+    from superset.extensions import appbuilder
+    from superset.utils.core import get_user_id
+    from superset.superset_typing import FlaskResponse
+
+    logger = logging.getLogger()
+
+    class SupersetIndexView(IndexView):
+        @expose("/")
+        def index(self) -> FlaskResponse:
+            if not g.user or not get_user_id():
+                # Steps for anonymous user
+                return redirect("/login")
+
+            # Steps for authenticated user
+            user_roles = security_manager.get_user_roles()
+            logger.warning('__DEBUG__ user roles: %s', pprint.pformat(user_roles))
+
+            for role in user_roles:
+                role_name = role.name
+                #logger.warning('__DEBUG__ role: %s', pprint.pformat(role))
+
+                if role_name == "CUSTOM_ROLE":
+                    return redirect("/dashboard/1")
+
+            # Default redirect if no specific role matched
+            return redirect("/dashboard/list")
+
+    FAB_INDEX_VIEW = f"{SupersetIndexView.__module__}.{SupersetIndexView.__name__}"
+  secret: |
+    # Generate your own secret key for encryption. Use openssl rand -base64 42 to generate a good key
+    SECRET_KEY = os.getenv('SECRET_KEY')
+    PREVIOUS_SECRET_KEY = os.getenv('PREVIOUS_SECRET_KEY')
+  slack: |
+    SLACK_API_TOKEN = os.getenv('SLACK_API_TOKEN')
+  smtp: |
+    SMTP_HOST = os.getenv('SMTP_HOST') # change to your host
+    SMTP_PORT = os.getenv('SMTP_PORT') # your port, e.g. 587
+    SMTP_STARTTLS = False
+    SMTP_SSL_SERVER_AUTH = True # If your using an SMTP server with a valid certificate
+    SMTP_SSL = True
+    SMTP_USER = os.getenv('SMTP_USER') # use the empty string "" if using an unauthenticated SMTP server
+    SMTP_PASSWORD = os.getenv('SMTP_PASSWORD') # use the empty string "" if using an unauthenticated SMTP server
+    SMTP_MAIL_FROM = os.getenv('SMTP_USER')
+    EMAIL_REPORTS_SUBJECT_PREFIX = "[Superset] " # optional - overwrites default value in config.py of "[Report] "
+  webdriver: |
+    WEBDRIVER_TYPE = "chrome"
+    WEBDRIVER_OPTION_ARGS = [
+        "--force-device-scale-factor=2.0",
+        "--high-dpi-support=2.0",
+        "--headless",
+        "--disable-gpu",
+        "--disable-dev-shm-usage",
+        "--no-sandbox",
+        "--disable-setuid-sandbox",
+        "--disable-extensions",
+    ]
+    SUPERSET_WEBSERVER_ADDRESS = "superset"
+    # This is for internal use, you can keep http
+    # WEBDRIVER_BASEURL = "http://superset:8088/"
+    WEBDRIVER_BASEURL = "http://staging.aura.adlucent.com/"
+
+    # This is the link sent to the recipient. Change to your domain, e.g. https://superset.mydomain.com
+    # WEBDRIVER_BASEURL_USER_FRIENDLY = "https://aura-k8s-prod.adlucent.com/"
+    WEBDRIVER_BASEURL_USER_FRIENDLY = "https://staging.aura.adlucent.com/"
+configOverridesFiles: {}
+envFromSecret: '{{ template "superset.fullname" . }}-env'
+envFromSecrets: []
+extraConfigMountPath: /app/configs
+extraConfigs: {}
+extraEnv:
+  AUTH_DOMAIN: adlucent.com
+  GEMINI_AVAILABLE_MODELS: '[{"name": "gemini-2.0-flash"}, {"name": "gemini-2.5-pro-preview-06-05"},
+    {"name": "gemini-2.5-flash-preview-05-20"}]'
+extraEnvRaw:
+- name: DB_PASS
+  valueFrom:
+    secretKeyRef:
+      key: password
+      name: cloudsql-db-credentials
+- name: DB_USER
+  valueFrom:
+    secretKeyRef:
+      key: username
+      name: cloudsql-db-credentials
+- name: DB_NAME
+  valueFrom:
+    secretKeyRef:
+      key: dbname
+      name: cloudsql-db-credentials
+- name: SECRET_KEY
+  valueFrom:
+    secretKeyRef:
+      key: secret-key
+      name: secret-key
+- name: SUPERSET_SECRET_KEY
+  valueFrom:
+    secretKeyRef:
+      key: secret-key
+      name: secret-key
+- name: PREVIOUS_SECRET_KEY
+  valueFrom:
+    secretKeyRef:
+      key: secret-key-cloudrun
+      name: secret-key
+- name: GOOGLE_CLIENT_ID
+  valueFrom:
+    secretKeyRef:
+      key: google-key
+      name: google-keys
+- name: GOOGLE_CLIENT_SECRET
+  valueFrom:
+    secretKeyRef:
+      key: google-secret
+      name: google-keys
+- name: SMTP_HOST
+  valueFrom:
+    secretKeyRef:
+      key: smtp-host
+      name: smtp-settings
+- name: SMTP_PORT
+  valueFrom:
+    secretKeyRef:
+      key: smtp-port
+      name: smtp-settings
+- name: SMTP_USER
+  valueFrom:
+    secretKeyRef:
+      key: smtp-user
+      name: smtp-settings
+- name: SMTP_PASSWORD
+  valueFrom:
+    secretKeyRef:
+      key: smtp-password
+      name: smtp-settings
+- name: OAUTH_BASE_URL
+  valueFrom:
+    secretKeyRef:
+      key: oauth-base-url
+      name: oauth-settings
+- name: OAUTH_CLIENT_ID
+  valueFrom:
+    secretKeyRef:
+      key: oauth-client-id
+      name: oauth-settings
+- name: OAUTH_CLIENT_SECRET
+  valueFrom:
+    secretKeyRef:
+      key: oauth-client-secret
+      name: oauth-settings
+- name: MAPBOX_API_KEY
+  valueFrom:
+    secretKeyRef:
+      key: mapbox-api-key
+      name: mapbox-api-key
+- name: SLACK_API_TOKEN
+  valueFrom:
+    secretKeyRef:
+      key: slack-api-token
+      name: slack-api-token
+- name: GEMINI_API_KEY
+  valueFrom:
+    secretKeyRef:
+      key: gemini-api-key
+      name: gemini-api-key
+extraSecretEnv: {}
+extraSecrets: {}
+extraVolumeMounts: []
+extraVolumes: []
+fullnameOverride: null
+hostAliases: []
+image:
+  pullPolicy: Always
+  repository: gcr.io/adl-aura-staging/superset-aura
+  tag: latest
+imagePullSecrets: []
+ingress:
+  annotations: {}
+  enabled: false
+  extraHostsRaw: []
+  hosts:
+  - chart-example.local
+  ingressClassName: null
+  path: /
+  pathType: ImplementationSpecific
+  tls: []
+init:
+  adminUser:
+    email: admin@superset.com
+    firstname: Superset
+    lastname: Admin
+    password: admin
+    username: admin
+  affinity: {}
+  command:
+  - /bin/sh
+  - -c
+  - . {{ .Values.configMountPath }}/superset_bootstrap.sh; . {{ .Values.configMountPath
+    }}/superset_init.sh
+  containerSecurityContext: {}
+  createAdmin: true
+  enabled: true
+  initContainers:
+  - command:
+    - /bin/sh
+    - -c
+    - dockerize -wait "tcp://$DB_HOST:$DB_PORT" -timeout 120s
+    envFrom:
+    - secretRef:
+        name: '{{ tpl .Values.envFromSecret . }}'
+    image: '{{ .Values.initImage.repository }}:{{ .Values.initImage.tag }}'
+    imagePullPolicy: '{{ .Values.initImage.pullPolicy }}'
+    name: wait-for-postgres
+  initscript: |-
+    #!/bin/sh
+    set -eu
+    echo "Upgrading DB schema..."
+    superset db upgrade
+    echo "Initializing roles..."
+    superset init
+    {{ if .Values.init.createAdmin }}
+    echo "Creating admin user..."
+    superset fab create-admin \
+                    --username {{ .Values.init.adminUser.username }} \
+                    --firstname {{ .Values.init.adminUser.firstname }} \
+                    --lastname {{ .Values.init.adminUser.lastname }} \
+                    --email {{ .Values.init.adminUser.email }} \
+                    --password {{ .Values.init.adminUser.password }} \
+                    || true
+    {{- end }}
+    {{ if .Values.init.loadExamples }}
+    echo "Loading examples..."
+    superset load_examples
+    {{- end }}
+    if [ -f "{{ .Values.extraConfigMountPath }}/import_datasources.yaml" ]; then
+      echo "Importing database connections.... "
+      superset import_datasources -p {{ .Values.extraConfigMountPath }}/import_datasources.yaml
+    fi
+  jobAnnotations:
+    helm.sh/hook: post-install,post-upgrade
+    helm.sh/hook-delete-policy: before-hook-creation
+  loadExamples: false
+  podAnnotations: {}
+  podSecurityContext: {}
+  resources: {}
+  tolerations: []
+  topologySpreadConstraints: []
+initImage:
+  pullPolicy: IfNotPresent
+  repository: apache/superset
+  tag: dockerize
+nameOverride: null
+nodeSelector: {}
+postgresql:
+  auth:
+    database: superset
+    existingSecret: null
+    password: superset
+    username: superset
+  enabled: false
+  image:
+    tag: 14.6.0-debian-11-r13
+  primary:
+    persistence:
+      accessModes:
+      - ReadWriteOnce
+      enabled: true
+    service:
+      ports:
+        postgresql: "5432"
+redis:
+  architecture: standalone
+  auth:
+    enabled: false
+    existingSecret: ""
+    existingSecretKey: ""
+    password: superset
+  enabled: true
+  master:
+    persistence:
+      accessModes:
+      - ReadWriteOnce
+      enabled: false
+resources: {}
+runAsUser: 1000
+service:
+  ports:
+  - name: http
+    port: 8088
+    targetPort: http
+  type: ClusterIP
+serviceAccount:
+  annotations: {}
+  create: false
+  name: superset
+serviceAccountName: null
+supersetCeleryBeat:
+  affinity: {}
+  command:
+  - /bin/sh
+  - -c
+  - . {{ .Values.configMountPath }}/superset_bootstrap.sh; celery --app=superset.tasks.celery_app:app
+    beat -l DEBUG --pidfile /tmp/celerybeat.pid --schedule /tmp/celerybeat-schedule
+  containerSecurityContext: {}
+  deploymentAnnotations: {}
+  enabled: true
+  extraContainers: []
+  forceReload: false
+  initContainers:
+  - command:
+    - /bin/sh
+    - -c
+    - dockerize -wait "tcp://$DB_HOST:$DB_PORT" -wait "tcp://$REDIS_HOST:$REDIS_PORT"
+      -timeout 120s
+    envFrom:
+    - secretRef:
+        name: '{{ tpl .Values.envFromSecret . }}'
+    image: '{{ .Values.initImage.repository }}:{{ .Values.initImage.tag }}'
+    imagePullPolicy: '{{ .Values.initImage.pullPolicy }}'
+    name: wait-for-postgres-redis
+  podAnnotations: {}
+  podLabels: {}
+  podSecurityContext: {}
+  resources: {}
+  topologySpreadConstraints: []
+supersetCeleryFlower:
+  affinity: {}
+  command:
+  - /bin/sh
+  - -c
+  - celery --app=superset.tasks.celery_app:app flower
+  containerSecurityContext: {}
+  deploymentAnnotations: {}
+  enabled: false
+  extraContainers: []
+  initContainers:
+  - command:
+    - /bin/sh
+    - -c
+    - dockerize -wait "tcp://$DB_HOST:$DB_PORT" -wait "tcp://$REDIS_HOST:$REDIS_PORT"
+      -timeout 120s
+    envFrom:
+    - secretRef:
+        name: '{{ tpl .Values.envFromSecret . }}'
+    image: '{{ .Values.initImage.repository }}:{{ .Values.initImage.tag }}'
+    imagePullPolicy: '{{ .Values.initImage.pullPolicy }}'
+    name: wait-for-postgres-redis
+  livenessProbe:
+    failureThreshold: 3
+    httpGet:
+      path: /api/workers
+      port: flower
+    initialDelaySeconds: 5
+    periodSeconds: 5
+    successThreshold: 1
+    timeoutSeconds: 1
+  podAnnotations: {}
+  podLabels: {}
+  podSecurityContext: {}
+  readinessProbe:
+    failureThreshold: 3
+    httpGet:
+      path: /api/workers
+      port: flower
+    initialDelaySeconds: 5
+    periodSeconds: 5
+    successThreshold: 1
+    timeoutSeconds: 1
+  replicaCount: 1
+  resources: {}
+  service:
+    annotations: {}
+    loadBalancerIP: null
+    nodePort:
+      http: nil
+    port: 5555
+    type: ClusterIP
+  startupProbe:
+    failureThreshold: 60
+    httpGet:
+      path: /api/workers
+      port: flower
+    initialDelaySeconds: 5
+    periodSeconds: 5
+    successThreshold: 1
+    timeoutSeconds: 1
+  topologySpreadConstraints: []
+supersetNode:
+  affinity: {}
+  autoscaling:
+    enabled: false
+    maxReplicas: 100
+    minReplicas: 1
+    targetCPUUtilizationPercentage: 80
+  command:
+  - /bin/sh
+  - -c
+  - . {{ .Values.configMountPath }}/superset_bootstrap.sh; /usr/bin/run-server.sh
+  connections:
+    db_host: 10.55.176.4
+    db_name: '{{ .Values.secret.cloudsql-db-credentials.dbname | b64dec | quote }}'
+    db_pass: '{{ .Values.secret.cloudsql-db-credentials.password | b64dec | quote
+      }}'
+    db_port: "5432"
+    db_user: '{{ .Values.secret.cloudsql-db-credentials.username | b64dec | quote
+      }}'
+    redis_host: '{{ .Release.Name }}-redis-headless'
+    redis_port: "6379"
+  containerSecurityContext: {}
+  deploymentAnnotations: {}
+  deploymentLabels: {}
+  env: {}
+  extraContainers: []
+  forceReload: false
+  initContainers:
+  - command:
+    - /bin/sh
+    - -c
+    - dockerize -wait "tcp://$DB_HOST:$DB_PORT" -timeout 120s
+    envFrom:
+    - secretRef:
+        name: '{{ tpl .Values.envFromSecret . }}'
+    image: '{{ .Values.initImage.repository }}:{{ .Values.initImage.tag }}'
+    imagePullPolicy: '{{ .Values.initImage.pullPolicy }}'
+    name: wait-for-postgres
+  livenessProbe:
+    failureThreshold: 3
+    httpGet:
+      path: /health
+      port: http
+    initialDelaySeconds: 15
+    periodSeconds: 15
+    successThreshold: 1
+    timeoutSeconds: 1
+  podAnnotations: {}
+  podLabels: {}
+  podSecurityContext: {}
+  readinessProbe:
+    failureThreshold: 3
+    httpGet:
+      path: /health
+      port: http
+    initialDelaySeconds: 15
+    periodSeconds: 15
+    successThreshold: 1
+    timeoutSeconds: 1
+  replicaCount: 2
+  resources: {}
+  startupProbe:
+    failureThreshold: 60
+    httpGet:
+      path: /health
+      port: http
+    initialDelaySeconds: 15
+    periodSeconds: 5
+    successThreshold: 1
+    timeoutSeconds: 1
+  strategy: {}
+  topologySpreadConstraints: []
+supersetWebsockets:
+  affinity: {}
+  command: []
+  config:
+    jwtCookieName: async-token
+    jwtSecret: sd898eoi3w808wu3q8q838ufg89laknvbgpOPSJOG903PQJDEU-MDKJSHUHAJSGY7FT67ANB32
+    logFilename: app.log
+    logLevel: debug
+    logToFile: false
+    port: 8080
+    redis:
+      db: 0
+      host: 127.0.0.1
+      password: ""
+      port: 6379
+      ssl: false
+    redisStreamPrefix: async-events-
+    statsd:
+      globalTags: []
+      host: 127.0.0.1
+      port: 8125
+  containerSecurityContext: {}
+  deploymentAnnotations: {}
+  enabled: false
+  extraContainers: []
+  image:
+    pullPolicy: IfNotPresent
+    repository: oneacrefund/superset-websocket
+    tag: latest
+  ingress:
+    path: /ws
+    pathType: Prefix
+  livenessProbe:
+    failureThreshold: 3
+    httpGet:
+      path: /health
+      port: ws
+    initialDelaySeconds: 5
+    periodSeconds: 5
+    successThreshold: 1
+    timeoutSeconds: 1
+  podAnnotations: {}
+  podLabels: {}
+  podSecurityContext: {}
+  readinessProbe:
+    failureThreshold: 3
+    httpGet:
+      path: /health
+      port: ws
+    initialDelaySeconds: 5
+    periodSeconds: 5
+    successThreshold: 1
+    timeoutSeconds: 1
+  replicaCount: 1
+  resources: {}
+  service:
+    annotations: {}
+    loadBalancerIP: null
+    nodePort:
+      http: nil
+    port: 8080
+    type: ClusterIP
+  startupProbe:
+    failureThreshold: 60
+    httpGet:
+      path: /health
+      port: ws
+    initialDelaySeconds: 5
+    periodSeconds: 5
+    successThreshold: 1
+    timeoutSeconds: 1
+  strategy: {}
+  topologySpreadConstraints: []
+supersetWorker:
+  affinity: {}
+  autoscaling:
+    enabled: false
+    maxReplicas: 100
+    minReplicas: 1
+    targetCPUUtilizationPercentage: 80
+  command:
+  - /bin/sh
+  - -c
+  - . {{ .Values.configMountPath }}/superset_bootstrap.sh; celery --app=superset.tasks.celery_app:app
+    worker -l DEBUG
+  containerSecurityContext: {}
+  deploymentAnnotations: {}
+  deploymentLabels: {}
+  extraContainers: []
+  forceReload: false
+  initContainers:
+  - command:
+    - /bin/sh
+    - -c
+    - dockerize -wait "tcp://$DB_HOST:$DB_PORT" -timeout 120s
+    envFrom:
+    - secretRef:
+        name: '{{ tpl .Values.envFromSecret . }}'
+    image: '{{ .Values.initImage.repository }}:{{ .Values.initImage.tag }}'
+    imagePullPolicy: '{{ .Values.initImage.pullPolicy }}'
+    name: wait-for-postgres-redis
+  livenessProbe:
+    exec:
+      command:
+      - sh
+      - -c
+      - celery -A superset.tasks.celery_app:app inspect ping -d celery@$HOSTNAME
+    failureThreshold: 3
+    initialDelaySeconds: 120
+    periodSeconds: 60
+    successThreshold: 1
+    timeoutSeconds: 60
+  podAnnotations: {}
+  podLabels: {}
+  podSecurityContext: {}
+  readinessProbe: {}
+  replicaCount: 1
+  resources: {}
+  startupProbe: {}
+  strategy: {}
+  topologySpreadConstraints: []
+tolerations: []
+topologySpreadConstraints: []

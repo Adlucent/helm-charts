@@ -1,0 +1,5 @@
+redis:
+  image:
+    registry: gcr.io
+    repository: adl-aura-staging/redis
+    tag: 7.0.10-debian-11-r4
