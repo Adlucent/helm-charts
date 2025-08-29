@@ -81,7 +81,7 @@ diagnosticMode:
 ##
 image:
   registry: gcr.io
-  repository: adl-aura-staging/redis
+  repository: adl-aura/redis
   tag: 7.0.10-debian-11-r4
   digest: ""
   ## Specify a imagePullPolicy

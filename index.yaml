@@ -5,7 +5,7 @@ entries:
       category: Database
     apiVersion: v2
     appVersion: 15.1.0
-    created: "2025-08-29T05:54:49.958949-06:00"
+    created: "2025-08-29T06:46:32.838496-06:00"
     dependencies:
     - name: common
       repository: https://charts.bitnami.com/bitnami
@@ -41,7 +41,7 @@ entries:
       licenses: Apache-2.0
     apiVersion: v2
     appVersion: 7.0.10
-    created: "2025-08-29T05:54:49.96344-06:00"
+    created: "2025-08-29T06:46:32.842865-06:00"
     dependencies:
     - name: common
       repository: https://charts.bitnami.com/bitnami
@@ -70,7 +70,7 @@ entries:
   superset:
   - apiVersion: v2
     appVersion: 3.0.1
-    created: "2025-08-29T05:54:49.971206-06:00"
+    created: "2025-08-29T06:46:32.849507-06:00"
     dependencies:
     - condition: postgresql.enabled
       name: postgresql
@@ -82,7 +82,7 @@ entries:
       version: 17.9.4
     description: Apache Superset is a modern, enterprise-ready business intelligence
       web application
-    digest: 39167f943ddfad9cb5197f31f6422381228a64a3ce9d86a99644350cba9ffa9e
+    digest: c843430213555ae5203ad248eaa66af8f58e8bcc579470bce1e3d100aec8ddf6
     home: https://superset.apache.org/
     icon: https://artifacthub.io/image/68c1d717-0e97-491f-b046-754e46f46922@2x
     keywords:
@@ -100,7 +100,7 @@ entries:
     version: 0.10.15
   - apiVersion: v2
     appVersion: 3.0.1
-    created: "2025-08-29T05:54:49.978567-06:00"
+    created: "2025-08-29T06:46:32.857014-06:00"
     dependencies:
     - condition: postgresql.enabled
       name: postgresql
@@ -128,4 +128,4 @@ entries:
     urls:
     - https://adlucent.github.io/helm-charts/.deploy/superset-0.10.15.tgz
     version: 0.10.15
-generated: "2025-08-29T05:54:49.953275-06:00"
+generated: "2025-08-29T06:46:32.835353-06:00"
